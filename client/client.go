@@ -1,4 +1,1 @@
 package client
-
-func Run() {
-}

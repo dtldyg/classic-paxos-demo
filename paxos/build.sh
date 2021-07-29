@@ -1,0 +1,1 @@
+go build -o paxos.exe paxos.go
