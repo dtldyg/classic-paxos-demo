@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	// config & discovery
 	nodeList = map[string][2]string{
 		"1": {"127.0.0.1", "9001"},
 		"2": {"127.0.0.1", "9002"},
@@ -20,144 +21,155 @@ var (
 	mostVoteNum = len(nodeList)/2 + 1
 	myID        string
 
-	leaderID string
-
 	lock  sync.Mutex
-	promN string
-	curN  string
-	curV  string
+	insts = make(map[string]*inst)
 )
+
+type inst struct {
+	lock  sync.Mutex
+	chosV string // 选定的v（learn结果）
+	promN string // 承诺的n（阶段1结果）
+	currN string // 当前的n（阶段2结果）
+	currV string // 当前的v（阶段2结果）
+}
 
 func main() {
 	myID = os.Args[1]
-	go acceptor()
-	go proposer()
+	acceptor()
+	t := "0"
+	for !proposer(t) {
+		fmt.Println(111)
+		time.Sleep(time.Second)
+	}
+	log(mustGetInst(t).chosV)
 	select {}
 }
 
+// ========== paxos只负责指定inst的单值一致性工作 ==========
 func acceptor() {
-	http.HandleFunc("/learn", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/learner", func(w http.ResponseWriter, r *http.Request) {
 		// 返回当前v
-		lock.Lock()
-		v := curV
-		lock.Unlock()
+		reqT := r.FormValue("t")
+		inst := mustGetInst(reqT)
+
+		inst.lock.Lock()
+		v := inst.currV
+		inst.lock.Unlock()
+
 		_, _ = io.WriteString(w, v)
 	})
 	http.HandleFunc("/phase1", func(w http.ResponseWriter, r *http.Request) {
-		// 若当前n小于reqN，返回当前n-v，否则返回空串
+		// 若承诺n小于reqN，返回当前n-v并承诺reqN，否则返回空串
+		reqT := r.FormValue("t")
 		reqN := r.FormValue("n")
-		lock.Lock()
-		if reqN <= promN {
+		inst := mustGetInst(reqT)
+
+		inst.lock.Lock()
+		if reqN <= inst.promN {
 			return
 		}
-		promN = reqN
-		curNV := fmt.Sprintf("%s,%s", curN, curV)
-		lock.Unlock()
+		inst.promN = reqN
+		curNV := fmt.Sprintf("%s,%s", inst.currN, inst.currV)
+		inst.lock.Unlock()
+
 		_, _ = io.WriteString(w, curNV)
 	})
 	http.HandleFunc("/phase2", func(w http.ResponseWriter, r *http.Request) {
 		// 尝试批准reqN-V
+		reqT := r.FormValue("t")
 		reqN := r.FormValue("n")
 		reqV := r.FormValue("v")
-		lock.Lock()
-		if reqN >= promN {
-			curN = reqN
-			curV = reqV
+		inst := mustGetInst(reqT)
+
+		inst.lock.Lock()
+		if reqN >= inst.promN {
+			inst.currN = reqN
+			inst.currV = reqV
 		}
-		lock.Unlock()
+		inst.lock.Unlock()
 	})
-	_ = http.ListenAndServe(fmt.Sprintf(":%s", nodeList[myID][1]), nil)
+	go func() {
+		_ = http.ListenAndServe(fmt.Sprintf(":%s", nodeList[myID][1]), nil)
+	}()
 }
 
-func proposer() {
-	for {
-		ticker := time.NewTicker(time.Second * 3)
-		<-ticker.C
-		alive := learn()
-		if len(alive) < mostVoteNum {
-			continue
-		}
-		if leaderID != "" && alive[leaderID] {
-			continue
-		}
-		// 无leader，或leader失联
-		n := fmt.Sprintf("%d-%s", time.Now().Unix(), myID)
-		v := myID
-		promise, maxV, suc := phase1(alive, n)
-		if !suc {
-			continue
-		}
-		if maxV != "" {
-			v = maxV
-		}
-		phase2(promise, n, v)
+func proposer(t string) (suc bool) {
+	chosV, alive := learner(t)
+	if len(alive) < mostVoteNum {
+		return
 	}
+	if chosV != "" {
+		inst := mustGetInst(t)
+		inst.chosV = chosV
+		suc = true
+		return
+	}
+	n := fmt.Sprintf("%d-%s", time.Now().Unix(), myID)
+	v := myID
+	p1Suc, usedV, prom := phase1(t, n, v, alive)
+	if !p1Suc {
+		return
+	}
+	phase2(t, n, usedV, prom)
+	return
 }
 
-// learn ping all node, update leaderID, return alive node id list
-func learn() map[string]bool {
-	alive := make(map[string]bool)
+func learner(t string) (chosV string, alive []string) {
+	alive = make([]string, 0)
 	learnV := make(map[string]int)
 	for id, addr := range nodeList {
-		v, suc := get(addr, "learn")
+		v, suc := httpGet(addr, fmt.Sprintf("learner?t=%s", t))
 		if !suc {
-			// 失联
 			continue
 		}
-		alive[id] = true
+		alive = append(alive, id)
 		learnV[v]++
 	}
 	for v, vote := range learnV {
 		if vote >= mostVoteNum {
-			leaderID = v
+			chosV = v
 			break
 		}
 	}
-	return alive
+	return chosV, alive
 }
 
-// phase-1
-func phase1(alive map[string]bool, n string) ([]string, string, bool) {
-	count := 0
-	promise := make([]string, 0)
+func phase1(t, n, v string, alive []string) (suc bool, usedV string, prom []string) {
 	maxN := ""
-	maxV := ""
-	for id := range alive {
-		maxNV, suc := get(nodeList[id], fmt.Sprintf("phase1?n=%s", n))
+	usedV = v
+	prom = make([]string, 0)
+	for _, id := range alive {
+		maxNV, suc := httpGet(nodeList[id], fmt.Sprintf("phase1?t=%s&n=%s", t, n))
 		if !suc {
-			// 失联
 			continue
 		}
 		if maxNV == "" {
-			// 未做出承诺
 			continue
 		}
-		promise = append(promise, id)
+		prom = append(prom, id)
 		maxNVs := strings.Split(maxNV, ",")
 		if maxNVs[0] > maxN {
 			maxN = maxNVs[0]
-			maxV = maxNVs[1]
+			usedV = maxNVs[1]
 		}
-		count++
-		if count >= mostVoteNum {
+		if len(prom) >= mostVoteNum {
 			break
 		}
 	}
-	if count < mostVoteNum {
-		return nil, "", false
+	if len(prom) < mostVoteNum {
+		return
 	}
-	return promise, maxV, true
+	suc = true
+	return
 }
 
-// phase-2
-func phase2(promise []string, n string, v string) {
-	for _, id := range promise {
-		_, _ = get(nodeList[id], fmt.Sprintf("phase2?n=%s&v=%s", n, v))
+func phase2(t, n, v string, prom []string) {
+	for _, id := range prom {
+		_, _ = httpGet(nodeList[id], fmt.Sprintf("phase2?t=%s&n=%s&v=%s", t, n, v))
 	}
 }
 
-// get do http GET request
-func get(addr [2]string, path string) (string, bool) {
+func httpGet(addr [2]string, path string) (string, bool) {
 	client := http.Client{Timeout: time.Millisecond * 250}
 	resp, err := client.Get(fmt.Sprintf("http://%s:%s/%s", addr[0], addr[1], path))
 	if resp != nil {
@@ -170,6 +182,15 @@ func get(addr [2]string, path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func mustGetInst(t string) *inst {
+	lock.Lock()
+	defer lock.Unlock()
+	if insts[t] == nil {
+		insts[t] = &inst{}
+	}
+	return insts[t]
 }
 
 func log(format string, a ...interface{}) {
