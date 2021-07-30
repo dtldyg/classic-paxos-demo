@@ -30,38 +30,12 @@ var (
 
 func main() {
 	myID = os.Args[1]
-	log("myID: %s", myID)
-
-	go server()
-	for {
-		ticker := time.NewTicker(time.Second * 3)
-		<-ticker.C
-		log("----- tick -----")
-		log("leader: %s", leaderID)
-		alive := learn()
-		log("alive: %v", alive)
-		if len(alive) < mostVoteNum {
-			continue
-		}
-		if leaderID != "" && alive[leaderID] {
-			continue
-		}
-		// 无leader，或leader失联
-		n := fmt.Sprintf("%d-%s", time.Now().Unix(), myID)
-		v := myID
-		promise, maxV, suc := phase1(alive, n)
-		log("promise: %v, maxV: %s", promise, maxV)
-		if !suc {
-			continue
-		}
-		if maxV != "" {
-			v = maxV
-		}
-		phase2(promise, n, v)
-	}
+	go acceptor()
+	go proposer()
+	select {}
 }
 
-func server() {
+func acceptor() {
 	http.HandleFunc("/learn", func(w http.ResponseWriter, _ *http.Request) {
 		// 返回当前v
 		lock.Lock()
@@ -93,6 +67,31 @@ func server() {
 		lock.Unlock()
 	})
 	_ = http.ListenAndServe(fmt.Sprintf(":%s", nodeList[myID][1]), nil)
+}
+
+func proposer() {
+	for {
+		ticker := time.NewTicker(time.Second * 3)
+		<-ticker.C
+		alive := learn()
+		if len(alive) < mostVoteNum {
+			continue
+		}
+		if leaderID != "" && alive[leaderID] {
+			continue
+		}
+		// 无leader，或leader失联
+		n := fmt.Sprintf("%d-%s", time.Now().Unix(), myID)
+		v := myID
+		promise, maxV, suc := phase1(alive, n)
+		if !suc {
+			continue
+		}
+		if maxV != "" {
+			v = maxV
+		}
+		phase2(promise, n, v)
+	}
 }
 
 // learn ping all node, update leaderID, return alive node id list
